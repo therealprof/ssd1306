@@ -18,11 +18,13 @@
 //! }
 //! ```
 
+use crate::command::AddrMode;
 use crate::displayrotation::DisplayRotation;
 use crate::displaysize::DisplaySize;
 use crate::interface::DisplayInterface;
 use crate::mode::displaymode::DisplayModeTrait;
 use crate::properties::DisplayProperties;
+use core::cmp::min;
 use core::fmt;
 use hal::blocking::delay::DelayMs;
 use hal::digital::OutputPin;
@@ -34,6 +36,8 @@ pub enum BitmapCharacter {
     Bitmapped([u8; 8]),
     /// A newline character which causes the cursor to jump to the next line
     Newline,
+    /// A carriage return character which causes the cursor to jump to the start of the current line
+    CarriageReturn,
 }
 
 /// A trait to convert from a character to 8x8 bitmap
@@ -48,11 +52,12 @@ where
     DI: DisplayInterface,
 {
     fn to_bitmap(input: char) -> BitmapCharacter {
-        use BitmapCharacter::{Bitmapped, Newline};
+        use BitmapCharacter::{Bitmapped, CarriageReturn, Newline};
 
         // Populate the array with the data from the character array at the right index
         match input {
             '\n' => Newline,
+            '\r' => CarriageReturn,
             '!' => Bitmapped([0x00, 0x00, 0x5F, 0x00, 0x00, 0x00, 0x00, 0x00]),
             '"' => Bitmapped([0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00]),
             '#' => Bitmapped([0x14, 0x7F, 0x14, 0x7F, 0x14, 0x00, 0x00, 0x00]),
@@ -151,11 +156,69 @@ where
     }
 }
 
+/// Contains the new row that the cursor has wrapped around to
+struct CursorWrapEvent(u8);
+
+struct Cursor {
+    col: u8,
+    row: u8,
+    width: u8,
+    height: u8,
+}
+
+impl Cursor {
+    pub fn new(width_pixels: u8, height_pixels: u8) -> Self {
+        let width = width_pixels / 8;
+        let height = height_pixels / 8;
+        Cursor {
+            col: 0,
+            row: 0,
+            width,
+            height,
+        }
+    }
+
+    /// Advances the logical cursor by one character.
+    /// Returns a value indicating if this caused the cursor to wrap to the next line or the next screen.
+    pub fn advance(&mut self) -> Option<CursorWrapEvent> {
+        self.col = (self.col + 1) % self.width;
+        if self.col == 0 {
+            self.row = (self.row + 1) % self.height;
+            Some(CursorWrapEvent(self.row))
+        } else {
+            None
+        }
+    }
+
+    /// Sets the position of the logical cursor arbitrarily.
+    /// The position will be capped at the maximal possible position.
+    pub fn set_position(&mut self, col: u8, row: u8) {
+        self.col = min(col, self.width - 1);
+        self.row = min(row, self.height - 1);
+    }
+
+    /// Gets the position of the logical cursor on screen in (col, row) order
+    pub fn get_position(&self) -> (u8, u8) {
+        (self.col, self.row)
+    }
+
+    /// Gets the logical dimensions of the screen in terms of characters, as (width, height)
+    pub fn get_dimensions(&self) -> (u8, u8) {
+        (self.width, self.height)
+    }
+
+    /// Returns the number of characters which can be written to the current line before it will
+    /// wrap
+    pub fn get_remaining_columns_in_line(&self) -> u8 {
+        self.width - self.col
+    }
+}
+
 // TODO: Add to prelude
 /// Terminal mode handler
 pub struct TerminalMode<DI> {
     properties: DisplayProperties<DI>,
-    character_no: Option<u8>,
+    cursor: Option<Cursor>,
 }
 
 impl<DI> DisplayModeTrait<DI> for TerminalMode<DI>
@@ -166,7 +229,7 @@ where
     fn new(properties: DisplayProperties<DI>) -> Self {
         TerminalMode {
             properties,
-            character_no: None,
+            cursor: None,
         }
     }
 
@@ -180,7 +243,7 @@ impl<DI> TerminalMode<DI>
 where
     DI: DisplayInterface,
 {
-    /// Clear the display
+    /// Clear the display and reset the cursor to the top left corner
     pub fn clear(&mut self) -> Result<(), ()> {
         let display_size = self.properties.get_size();
 
@@ -190,12 +253,19 @@ where
             DisplaySize::Display96x16 => 24,
         };
 
-        // Reset position so we don't end up in some random place of our cleared screen
-        self.reset_pos()?;
+        // Let the chip handle line wrapping so we can fill the screen with blanks faster
+        self.properties.change_mode(AddrMode::Horizontal)?;
+        let (display_width, display_height) = self.properties.get_dimensions();
+        self.properties
+            .set_draw_area((0, 0), (display_width, display_height))?;
 
         for _ in 0..numchars {
             self.properties.draw(&[0; 8])?;
         }
+
+        // But for normal operation we manage the line wrapping
+        self.properties.change_mode(AddrMode::Page)?;
+        self.reset_pos()?;
 
         Ok(())
     }
@@ -225,57 +295,87 @@ where
     {
         match Self::to_bitmap(c) {
             BitmapCharacter::Bitmapped(ref buffer) => {
-                // Increment character counter
-                self.increment_character()?;
                 // Send the pixel data to the display
                 self.properties.draw(buffer)?;
+                // Increment character counter and potentially wrap line
+                self.advance_cursor()?;
             }
             BitmapCharacter::Newline => {
-                let counter = self.character_no.ok_or(())?;
-                let num_spaces = self.chars_per_line() - counter;
+                let num_spaces = self.ensure_cursor()?.get_remaining_columns_in_line();
                 for _ in 0..num_spaces {
-                    self.increment_character()?;
                     self.properties
                         .draw(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])?;
+                    self.advance_cursor()?;
                 }
+            }
+            BitmapCharacter::CarriageReturn => {
+                self.properties.set_column(0)?;
+                let (_, cur_line) = self.ensure_cursor()?.get_position();
+                self.ensure_cursor()?.set_position(0, cur_line);
             }
         }
 
         Ok(())
     }
 
-    /// Initialise the display in column mode (i.e. a byte walks down a column of 8 pixels) with
-    /// column 0 on the left and column _(display_width - 1)_ on the right.
+    /// Initialise the display in page mode (i.e. a byte walks down a column of 8 pixels) with
+    /// column 0 on the left and column _(display_width - 1)_ on the right, but no automatic line
+    /// wrapping.
     pub fn init(&mut self) -> Result<(), ()> {
-        self.properties.init_column_mode()?;
+        self.properties.init_with_mode(AddrMode::Page)?;
         self.reset_pos()?;
         Ok(())
     }
 
     /// Set the display rotation
     pub fn set_rotation(&mut self, rot: DisplayRotation) -> Result<(), ()> {
+        // we don't need to touch the cursor because rotating 90º or 270º currently just flips
         self.properties.set_rotation(rot)
+    }
+
+    /// Get the current cursor position, in character coordinates.
+    /// This is the (column, row) that the next character will be written to.
+    pub fn get_position(&self) -> Result<(u8, u8), ()> {
+        self.cursor.as_ref().map(|c| c.get_position()).ok_or(())
+    }
+
+    /// Set the cursor position, in character coordinates.
+    /// This is the (column, row) that the next character will be written to.
+    /// If the position is out of bounds, an Err will be returned.
+    pub fn set_position(&mut self, column: u8, row: u8) -> Result<(), ()> {
+        let (width, height) = self.ensure_cursor()?.get_dimensions();
+        if column >= width || row >= height {
+            Err(())
+        } else {
+            self.properties.set_column(column * 8)?;
+            self.properties.set_row(row * 8)?;
+            self.ensure_cursor()?.set_position(column, row);
+            Ok(())
+        }
     }
 
     /// Reset the draw area and move pointer to the top left corner
     fn reset_pos(&mut self) -> Result<(), ()> {
-        let (display_width, display_height) = self.properties.get_dimensions();
+        self.properties.set_column(0)?;
+        self.properties.set_row(0)?;
         // Initialise the counter when we know it's valid
-        self.character_no = Some(0);
-        self.properties
-            .set_draw_area((0, 0), (display_width, display_height))
+        let (display_width, display_height) = self.properties.get_dimensions();
+        self.cursor = Some(Cursor::new(display_width, display_height));
+
+        Ok(())
     }
 
-    /// Increment character counter, resetting if we've reached the end of the line
-    fn increment_character(&mut self) -> Result<(), ()> {
-        self.character_no = self.character_no.map(|n| (n + 1) % self.chars_per_line());
-        self.character_no.map(|_| ()).ok_or(())
+    /// Advance the cursor, automatically wrapping lines and/or screens if necessary
+    /// Takes in an already-unwrapped cursor to avoid re-unwrapping
+    fn advance_cursor(&mut self) -> Result<(), ()> {
+        if let Some(CursorWrapEvent(new_row)) = self.ensure_cursor()?.advance() {
+            self.properties.set_row(new_row * 8)?;
+        }
+        Ok(())
     }
 
-    /// Get the number of characters in a line
-    fn chars_per_line(&self) -> u8 {
-        let (line_width, _) = self.properties.get_dimensions();
-        line_width / 8
+    fn ensure_cursor(&mut self) -> Result<&mut Cursor, ()> {
+        self.cursor.as_mut().ok_or(())
     }
 }
 
